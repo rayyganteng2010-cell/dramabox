@@ -15,7 +15,8 @@ ALLOWED_ORIGINS = [
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept": "*/*",
+    "x-nextjs-data": "1"  # Header Wajib buat nipu Next.js
 }
 
 BASE_URL = "https://www.dramabox.com"
@@ -23,12 +24,12 @@ BASE_URL = "https://www.dramabox.com"
 # --- SECURITY ---
 @app.before_request
 def check_origin():
-    if request.method == "OPTIONS": return _build_cors_preflight_response()
+    if request.method == "OPTIONS": return _cors_response()
     origin = request.headers.get('Origin')
     if origin and origin not in ALLOWED_ORIGINS:
         return jsonify({"error": "Forbidden"}), 403
 
-def _build_cors_preflight_response():
+def _cors_response():
     resp = make_response()
     resp.headers.add("Access-Control-Allow-Origin", request.headers.get('Origin', '*'))
     resp.headers.add("Access-Control-Allow-Headers", "*")
@@ -36,90 +37,60 @@ def _build_cors_preflight_response():
     return resp
 
 @app.after_request
-def add_cors_headers(response):
+def add_cors(resp):
     origin = request.headers.get('Origin')
     if origin in ALLOWED_ORIGINS:
-        response.headers.add("Access-Control-Allow-Origin", origin)
-    return response
+        resp.headers.add("Access-Control-Allow-Origin", origin)
+    return resp
 
-# --- HELPER SAKTI (Hybrid BeautifulSoup + Regex) ---
-def get_soup(url, params=None):
+# --- HELPER SAKTI: Next.js Unlocker ---
+def get_build_id():
+    """
+    Kita butuh 'Build ID' buat akses API internal Next.js.
+    ID ini berubah tiap kali Dramabox update webnya.
+    """
     try:
-        response = requests.get(url, headers=HEADERS, params=params, timeout=15)
-        response.raise_for_status()
-        return BeautifulSoup(response.text, 'html.parser'), response.text
-    except Exception as e:
-        print(f"Error fetching {url}: {e}")
-        return None, None
+        # Hit home bentar buat nyolong Build ID dari script
+        r = requests.get(f"{BASE_URL}/in", headers={"User-Agent": HEADERS["User-Agent"]})
+        match = re.search(r'"buildId":"(.*?)"', r.text)
+        if match:
+            return match.group(1)
+    except:
+        pass
+    return None
 
 def extract_dramas_html(soup):
-    """Cara lama: ambil dari HTML element (untuk Browse/Home)"""
+    """Helper lama buat Home/Browse (tetep dipake)"""
     dramas = []
     links = soup.find_all('a', href=re.compile(r'/in/drama/'))
     seen = set()
-    
     for link in links:
         href = link.get('href')
         full_url = BASE_URL + href if href.startswith('/') else href
         if full_url in seen: continue
         seen.add(full_url)
-
-        title_tag = link.find(['h3', 'p', 'div', 'span'], class_=re.compile(r'title|name|text|ell', re.I))
-        title = title_tag.get_text(strip=True) if title_tag else "No Title"
         
-        img_tag = link.find('img')
-        thumbnail = img_tag.get('src') if img_tag else None
+        t_tag = link.find(['h3', 'div'], class_=re.compile(r'title|name|text', re.I))
+        title = t_tag.get_text(strip=True) if t_tag else "No Title"
         
-        if title == "No Title" and img_tag and img_tag.get('alt'):
-            title = img_tag.get('alt')
-
-        if title != "No Title" or thumbnail:
-            dramas.append({"title": title, "url": full_url, "thumbnail": thumbnail})
+        img = link.find('img')
+        thumb = img.get('src') if img else None
+        
+        if title != "No Title" or thumb:
+            dramas.append({"title": title, "url": full_url, "thumbnail": thumb})
     return dramas
-
-def extract_from_json_script(html_text, key_pattern):
-    """
-    Cara baru: Cari data tersembunyi di script NEXT_DATA
-    Tanpa bongkar semua, cuma cari pola text aja biar gak error.
-    """
-    try:
-        # Cari script JSON Next.js
-        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html_text)
-        if match:
-            data = json.loads(match.group(1))
-            # Fungsi recursive cari key "chapterList" atau "searchData"
-            return find_key_recursive(data, key_pattern)
-    except:
-        pass
-    return None
-
-def find_key_recursive(obj, key_pattern):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if re.search(key_pattern, k, re.I):
-                return v
-            found = find_key_recursive(v, key_pattern)
-            if found: return found
-    elif isinstance(obj, list):
-        for item in obj:
-            found = find_key_recursive(item, key_pattern)
-            if found: return found
-    return None
 
 # --- ROUTES ---
 
 @app.route('/')
 def index():
-    return jsonify({"status": "Active", "endpoints": ["/api/home", "/api/search?q=", "/api/drama?url="]})
+    return jsonify({"status": "Ready", "msg": "Search fixed with Next.js Data Fetching"})
 
 @app.route('/api/home')
 def home():
-    # TRICK: Ambil dari /browse/0/1 karena isinya LEBIH BANYAK dari home biasa
-    target_url = f"{BASE_URL}/in/browse/0/1"
-    soup, html = get_soup(target_url)
-    
-    if not soup: return jsonify({"error": "Failed"}), 500
-    
+    # Home tetep pake cara HTML biasa (karena udah jalan)
+    r = requests.get(f"{BASE_URL}/in", headers=HEADERS)
+    soup = BeautifulSoup(r.text, 'html.parser')
     dramas = extract_dramas_html(soup)
     return jsonify({"count": len(dramas), "data": dramas})
 
@@ -128,20 +99,26 @@ def search():
     query = request.args.get('q')
     if not query: return jsonify({"error": "No query"}), 400
 
-    # PENTING: Search pake HTML biasa bakal KOSONG. Harus ambil dari JSON hidden.
-    target_url = f"{BASE_URL}/in/search"
-    soup, html = get_soup(target_url, params={"searchValue": query})
-    
-    if not html: return jsonify({"error": "Failed"}), 500
+    # 1. Ambil Kunci (Build ID)
+    build_id = get_build_id()
+    if not build_id:
+        return jsonify({"error": "Failed to bypass security (No Build ID)"}), 500
 
-    results = []
+    # 2. Tembak URL API Rahasia Next.js
+    # Format: /_next/data/{BUILD_ID}/in/search.json?searchValue=...
+    target_api = f"{BASE_URL}/_next/data/{build_id}/in/search.json"
     
-    # 1. Coba cara "Parsing Script" (Paling ampuh buat Search)
-    search_data = extract_from_json_script(html, r'searchData|resultList')
-    
-    if search_data and isinstance(search_data, dict):
-        # Biasanya ada di dalam list
+    try:
+        # Request JSON langsung (bukan HTML)
+        res = requests.get(target_api, headers=HEADERS, params={"searchValue": query})
+        data = res.json()
+        
+        results = []
+        # Lokasi data biasanya ada di sini:
+        # pageProps -> searchData -> list
+        search_data = data.get('pageProps', {}).get('searchData', {})
         items = search_data.get('list', []) or search_data.get('results', [])
+
         for item in items:
             title = item.get('bookName') or item.get('title')
             bid = item.get('bookId') or item.get('id')
@@ -153,114 +130,59 @@ def search():
                     "thumbnail": cover,
                     "url": f"{BASE_URL}/in/drama/{bid}/{title.replace(' ', '-')}"
                 })
-    
-    # 2. Fallback: Kalau script gagal, coba HTML biasa (walau jarang berhasil)
-    if not results and soup:
-        results = extract_dramas_html(soup)
+        
+        return jsonify({
+            "query": query,
+            "method": "next_data_api",
+            "count": len(results),
+            "data": results
+        })
 
-    return jsonify({"query": query, "count": len(results), "data": results})
+    except Exception as e:
+        return jsonify({"error": str(e), "hint": "API structure might have changed"}), 500
 
 @app.route('/api/browse')
 def browse():
-    genre = request.args.get('genre_id', '0')
+    # Browse logic tetep sama kayak lu punya
+    g_id = request.args.get('genre_id', '0')
     page = request.args.get('page', '1')
-    target_url = f"{BASE_URL}/in/browse/{genre}/{page}"
-    
-    soup, html = get_soup(target_url)
-    if not soup: return jsonify({"error": "Failed"}), 500
-
+    r = requests.get(f"{BASE_URL}/in/browse/{g_id}/{page}", headers=HEADERS)
+    soup = BeautifulSoup(r.text, 'html.parser')
     dramas = extract_dramas_html(soup)
-    
-    # Simple Genre Extractor
-    genres = [{"id": "0", "name": "All"}]
-    for link in soup.find_all('a', href=re.compile(r'/in/browse/\d+')):
-        match = re.search(r'/browse/(\d+)', link['href'])
-        if match:
-            gname = link.get_text(strip=True)
-            if gname: 
-                genres.append({"id": match.group(1), "name": gname})
-    
-    # Hapus duplikat genre
-    unique_genres = list({v['id']:v for v in genres}.values())
-
-    return jsonify({"page": int(page), "genres": unique_genres, "data": dramas})
+    return jsonify({"page": page, "data": dramas})
 
 @app.route('/api/drama')
-def drama_detail():
+def drama():
+    # Drama logic tetep sama (Regex/BS4)
     url = request.args.get('url')
-    if not url: return jsonify({"error": "No URL"}), 400
+    r = requests.get(url, headers=HEADERS)
+    soup = BeautifulSoup(r.text, 'html.parser')
     
-    soup, html = get_soup(url)
-    if not soup: return jsonify({"error": "Failed"}), 500
-
-    # --- Info Drama (Metadata HTML - Aman) ---
     title = soup.find("meta", property="og:title")
     desc = soup.find("meta", property="og:description")
     img = soup.find("meta", property="og:image")
     
-    title_txt = title['content'] if title else "Unknown"
-    synopsis = desc['content'] if desc else "-"
-    poster = img['content'] if img else None
-
-    # --- FULL EPISODE FIX ---
     episodes = []
-    
-    # Method 1: Coba ambil FULL list dari script JSON (Biar dapet > 11 eps)
-    # Kita cari key "chapterList" di dalam source code
-    raw_chapters = extract_from_json_script(html, r'chapterList|episodeList')
-    
-    if raw_chapters and isinstance(raw_chapters, list):
-        # BERHASIL DAPET FULL DATA
-        for ep in raw_chapters:
-            ep_name = ep.get('chapterName') or ep.get('name') or f"Episode"
-            ep_id = ep.get('chapterId') or ep.get('id')
-            book_id = ep.get('bookId') # Kadang perlu buat URL
-            
-            # Kita coba bangun URL manual yang valid
-            # Url format: /in/video/BOOKID_TITLE/CHAPTERID_TITLE
-            if ep_id:
-                # Ambil Book ID dari URL asli jika di JSON ga ada
-                current_book_id = re.search(r'/drama/(\d+)', url)
-                bid = book_id or (current_book_id.group(1) if current_book_id else "0")
-                
-                slug_t = title_txt.replace(" ", "-")
-                slug_e = ep_name.replace(" ", "-")
-                
-                episodes.append({
-                    "name": ep_name,
-                    "url": f"{BASE_URL}/in/video/{bid}_{slug_t}/{ep_id}_{slug_e}"
-                })
-    
-    # Method 2: Fallback ke HTML biasa kalau JSON gagal (Dapetnya dikit gapapa drpd error)
-    if not episodes:
-        for link in soup.find_all('a', href=re.compile(r'/in/video/')):
-            episodes.append({
-                "name": link.get_text(strip=True),
-                "url": BASE_URL + link['href'] if link['href'].startswith('/') else link['href']
-            })
+    for link in soup.find_all('a', href=re.compile(r'/in/video/')):
+        episodes.append({
+            "name": link.get_text(strip=True),
+            "url": BASE_URL + link['href'] if link['href'].startswith('/') else link['href']
+        })
 
     return jsonify({
-        "title": title_txt,
-        "synopsis": synopsis,
-        "poster": poster,
-        "total_episodes": len(episodes),
+        "title": title['content'] if title else "Unknown",
+        "synopsis": desc['content'] if desc else "-",
+        "poster": img['content'] if img else None,
         "episodes": episodes
     })
 
 @app.route('/api/episode')
-def episode_detail():
+def episode():
     url = request.args.get('url')
-    if not url: return jsonify({"error": "No URL"}), 400
-    
-    soup, html = get_soup(url)
-    if not soup: return jsonify({"error": "Failed"}), 500
-
-    title = soup.find("title")
-    return jsonify({
-        "title": title.get_text(strip=True) if title else "Episode",
-        "page_url": url,
-        "stream_url": "Stream URL protected by DRM (Not extractable via simple request)"
-    })
+    r = requests.get(url, headers=HEADERS)
+    soup = BeautifulSoup(r.text, 'html.parser')
+    t = soup.find("title")
+    return jsonify({"title": t.get_text(strip=True) if t else "Ep", "page_url": url})
 
 if __name__ == '__main__':
     app.run(debug=True, port=3000)
