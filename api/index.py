@@ -11,7 +11,7 @@ app = Flask(__name__)
 # --- CONFIG ---
 ALLOWED_ORIGINS = [
     "https://frontend-kamu.vercel.app",
-    "http://localhost:3000",
+    "http://localhost:2435",
     "http://127.0.0.1:5500"
 ]
 
