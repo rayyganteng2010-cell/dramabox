@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 import re
 import json
 import time
+from urllib.parse import unquote
 
 app = Flask(__name__)
 
@@ -24,7 +25,7 @@ HEADERS = {
 
 BASE_URL = "https://www.dramabox.com"
 
-# --- SESSION GLOBAL (PENTING: cookies kebawa) ---
+# --- SESSION GLOBAL (cookies kebawa) ---
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
@@ -53,19 +54,19 @@ def add_cors_headers(response):
         response.headers.add("Vary", "Origin")
     return response
 
-# --- HELPERS ---
+
+# =========================
+# HELPERS
+# =========================
+
 _last_warm = 0
 
 def warmup():
-    """
-    Hit homepage dulu supaya cookie kebentuk.
-    Banyak site Next.js bikin state/cookie di entry page.
-    """
+    """Hit homepage dulu supaya cookie kebentuk."""
     global _last_warm
     now = time.time()
     if now - _last_warm < 60:
         return
-
     try:
         SESSION.get(f"{BASE_URL}/in/", timeout=15, allow_redirects=True)
         _last_warm = now
@@ -100,9 +101,7 @@ def get_soup(url, params=None):
         return None
 
 def extract_dramas_html(soup):
-    """
-    Fallback parser dari HTML biasa (kalau JSON gagal).
-    """
+    """Fallback parser HTML (kalau JSON gagal)."""
     dramas = []
     links = soup.find_all("a", href=re.compile(r"/in/drama/"))
     seen = set()
@@ -129,15 +128,16 @@ def extract_dramas_html(soup):
         if title == "No Title" and img_tag and img_tag.get("alt"):
             title = img_tag.get("alt")
 
+        if thumbnail:
+            thumbnail = normalize_img_url(thumbnail)
+
         if title != "No Title" or thumbnail:
             dramas.append({"title": title, "url": full_url, "thumbnail": thumbnail})
 
     return dramas
 
 def extract_next_data(soup):
-    """
-    Ambil __NEXT_DATA__ JSON.
-    """
+    """Ambil JSON __NEXT_DATA__."""
     script = soup.find("script", id="__NEXT_DATA__")
     if not script:
         return None
@@ -149,6 +149,94 @@ def extract_next_data(soup):
     except Exception as e:
         print(f"[extract_next_data] parse error: {e}")
         return None
+
+def slugify(s):
+    s = (s or "").strip()
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^a-zA-Z0-9\-]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s or "drama"
+
+# --- THUMBNAIL FIXER ---
+IMG_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", re.I)
+
+def normalize_img_url(u: str):
+    if not u or not isinstance(u, str):
+        return None
+    u = u.strip()
+
+    # next/image proxy: /_next/image?url=ENCODED...
+    if "/_next/image" in u and "url=" in u:
+        m = re.search(r"[?&]url=([^&]+)", u)
+        if m:
+            u = unquote(m.group(1))
+
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        return BASE_URL + u
+    return u
+
+def flatten_strings(obj, out):
+    if isinstance(obj, dict):
+        for v in obj.values():
+            flatten_strings(v, out)
+    elif isinstance(obj, list):
+        for i in obj:
+            flatten_strings(i, out)
+    elif isinstance(obj, str):
+        out.append(obj)
+
+def pick_thumbnail(item: dict):
+    """
+    Ambil thumbnail dari:
+    - key cover/poster/thumbnail yang beda-beda
+    - nested dict {url/src/...}
+    - fallback scan semua string dalam item buat nemu URL image
+    """
+    if not isinstance(item, dict):
+        return None
+
+    candidate_keys = [
+        "cover", "coverUrl", "coverURL",
+        "bookCover", "bookCoverUrl", "bookCoverURL",
+        "poster", "posterUrl", "posterURL",
+        "image", "imageUrl", "img", "imgUrl",
+        "thumbnail", "thumbnailUrl",
+        "icon", "iconUrl",
+        "verticalCover", "horizontalCover",
+        "pic", "picUrl"
+    ]
+
+    # 1) direct keys + nested
+    for k in candidate_keys:
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return normalize_img_url(v)
+        if isinstance(v, dict):
+            for subk in ("url", "src", "link", "path"):
+                sv = v.get(subk)
+                if isinstance(sv, str) and sv.strip():
+                    return normalize_img_url(sv)
+
+    # 2) fallback: scan semua string
+    strings = []
+    flatten_strings(item, strings)
+
+    # prefer yang mengandung kata cover/poster/thumb dulu
+    for s in strings:
+        ss = s.lower()
+        if ("cover" in ss or "poster" in ss or "thumb" in ss) and (("http" in ss) or ss.startswith("//") or ss.startswith("/")):
+            if IMG_EXT_RE.search(ss) or "image" in ss:
+                return normalize_img_url(s)
+
+    # last resort: URL image apa pun
+    for s in strings:
+        ss = s.lower()
+        if (("http" in ss) or ss.startswith("//") or ss.startswith("/")) and (IMG_EXT_RE.search(ss) or "image" in ss):
+            return normalize_img_url(s)
+
+    return None
 
 def find_list_items_by_fields(obj):
     """
@@ -166,32 +254,24 @@ def find_list_items_by_fields(obj):
                 keys = set()
                 for i in x[:10]:
                     keys |= set(i.keys())
-
-                if ("bookId" in keys or "id" in keys) and ("bookName" in keys or "title" in keys):
+                if ("bookId" in keys or "id" in keys) and ("bookName" in keys or "title" in keys or "name" in keys):
                     found_lists.append(x)
-
             for i in x:
                 walk(i)
 
     walk(obj)
     return found_lists
 
-def slugify(s):
-    s = (s or "").strip()
-    s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"[^a-zA-Z0-9\-]+", "-", s)
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    return s or "drama"
-
 def map_items_to_results(items):
     results = []
     for item in items:
-        title = item.get("bookName") or item.get("title")
+        title = item.get("bookName") or item.get("title") or item.get("name")
         bid = item.get("bookId") or item.get("id")
-        cover = item.get("cover") or item.get("coverUrl") or item.get("img") or item.get("image")
 
         if not title or not bid:
             continue
+
+        cover = pick_thumbnail(item)
 
         results.append({
             "title": title,
@@ -200,17 +280,20 @@ def map_items_to_results(items):
         })
     return results
 
-# --- ROUTES ---
+
+# =========================
+# ROUTES
+# =========================
+
 @app.route("/")
 def index():
-    return jsonify({"status": "Active", "msg": "Dramabox scraper (search fixed)"})
+    return jsonify({"status": "Active", "msg": "Dramabox scraper (search + thumbnail fixed)"})
 
 @app.route("/api/home")
 def home():
     soup = get_soup(f"{BASE_URL}/in/browse/0/1")
     if not soup:
         return jsonify({"error": "Failed"}), 500
-
     dramas = extract_dramas_html(soup)
     return jsonify({"count": len(dramas), "data": dramas})
 
@@ -226,7 +309,7 @@ def search():
 
     results = []
 
-    # 1) Utama: parse __NEXT_DATA__
+    # 1) parse __NEXT_DATA__
     data = extract_next_data(soup)
     if data:
         candidate_lists = find_list_items_by_fields(data)
@@ -234,15 +317,11 @@ def search():
             best = max(candidate_lists, key=len)
             results = map_items_to_results(best)
 
-    # 2) Fallback: parse HTML
+    # 2) fallback HTML
     if not results:
         results = extract_dramas_html(soup)
 
-    return jsonify({
-        "query": query,
-        "count": len(results),
-        "data": results
-    })
+    return jsonify({"query": query, "count": len(results), "data": results})
 
 @app.route("/api/browse")
 def browse():
@@ -268,11 +347,7 @@ def browse():
     # Unique by id
     unique_genres = list({g["id"]: g for g in genres}.values())
 
-    return jsonify({
-        "page": int(page),
-        "genres": unique_genres,
-        "data": dramas
-    })
+    return jsonify({"page": int(page), "genres": unique_genres, "data": dramas})
 
 @app.route("/api/drama")
 def drama_detail():
@@ -291,15 +366,16 @@ def drama_detail():
     title = title_meta["content"] if title_meta and title_meta.get("content") else "Unknown"
     synopsis = desc_meta["content"] if desc_meta and desc_meta.get("content") else "-"
     poster = img_meta["content"] if img_meta and img_meta.get("content") else None
+    if poster:
+        poster = normalize_img_url(poster)
 
     episodes = []
 
-    # coba ambil dari __NEXT_DATA__
+    # coba ambil episode dari __NEXT_DATA__
     data = extract_next_data(soup)
     raw_eps = None
 
     if data:
-        # cari list yang punya signature episode/chapter
         def find_episode_lists(obj):
             lists = []
             def walk(x):
@@ -311,7 +387,6 @@ def drama_detail():
                         keys = set()
                         for i in x[:10]:
                             keys |= set(i.keys())
-                        # signature episode/chapter
                         if ("chapterId" in keys or "id" in keys) and ("chapterName" in keys or "name" in keys):
                             lists.append(x)
                     for i in x:
@@ -324,7 +399,6 @@ def drama_detail():
             raw_eps = max(eps_lists, key=len)
 
     if raw_eps and isinstance(raw_eps, list):
-        # ambil bookId dari url input
         m = re.search(r"/drama/(\d+)", url)
         book_id_from_url = m.group(1) if m else None
 
@@ -374,6 +448,7 @@ def episode_detail():
         "title": t.get_text(strip=True) if t else "Episode",
         "page_url": url
     })
+
 
 if __name__ == "__main__":
     app.run(debug=True, port=3000)
